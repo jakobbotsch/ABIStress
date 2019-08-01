@@ -1,80 +1,132 @@
 ﻿using Microsoft.VisualBasic;
 using Microsoft.VisualBasic.CompilerServices;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace TailcallStress
 {
-    class Program
+    internal class Program
     {
         internal const string CallerPrefix = "TCStress_Caller";
         internal const string CalleePrefix = "TCStress_Callee";
 
-        private static void Main(string[] args)
+        private static int Main(string[] args)
         {
-            Random rand = new Random(12341234);
-            // Create callees. They just return one of the arguments.
+            // Create callees. We do not emit the bodies yet, but we do need the parameter lists.
+            // These will be used to select appopriate callees when generating callers below, making
+            // sure that each caller has more stack arg space than each callee.
             const int numCallees = 10000;
-            TailCallee[] callees = Enumerable.Range(0, numCallees).Select(i => CreateCallee(i, rand)).ToArray();
+            List<TailCallee> callees = Enumerable.Range(0, numCallees).Select(CreateCallee).ToList();
 
             using var tcel = new TailCallEventListener();
-            void Go(int index) => DoTailCall(index, callees, tcel);
 
-            bool TryGetIndexFromEnvVar(string name, out int index)
+            int mismatches = 0;
+            if (args.Length > 0 && int.TryParse(args[0], out int index))
             {
-                string value = Environment.GetEnvironmentVariable(name);
-                foreach (string prefix in new[] { CallerPrefix, CalleePrefix })
-                {
-                    if (value.StartsWith(prefix))
-                        return int.TryParse(value.Substring(prefix.Length), out index);
-                }
-
-                index = -1;
-                return false;
-            }
-
-            if (TryGetIndexFromEnvVar("COMPlus_JitDisasm", out int index) ||
-                TryGetIndexFromEnvVar("COMPlus_JitDump", out index))
-            {
-                Go(index);
+                if (!TryTailCall(index, callees))
+                    mismatches++;
             }
             else
             {
-                for (int i = 0; i < 100000; i++)
-                    Go(i);
+                bool abortLoop = false;
+                Console.CancelKeyPress += (sender, args) =>
+                {
+                    args.Cancel = true;
+                    abortLoop = true;
+                };
+
+                for (int i = 0; i < 1000000 && !abortLoop; i++)
+                {
+                    if (!TryTailCall(i, callees))
+                        mismatches++;
+
+                    if (i % 50 == 0)
+                        Console.Title = $"{tcel.NumCallersSeen} callers emitted, {tcel.NumSuccessfulTailCalls} tailcalls tested";
+                }
             }
+
+            Console.WriteLine("{0} tailcalls tested", tcel.NumSuccessfulTailCalls);
+            lock (tcel.FailureReasons)
+            {
+                if (tcel.FailureReasons.Count != 0)
+                {
+                    int numRejected = tcel.FailureReasons.Values.Sum();
+                    Console.WriteLine("{0} rejected tailcalls. Breakdown:", numRejected);
+                    foreach (var (reason, count) in tcel.FailureReasons.OrderByDescending(kvp => kvp.Value))
+                        Console.WriteLine("[{0:00.00}]: {1}", count / (double)numRejected * 100, reason);
+                }
+            }
+
+            return 100 + mismatches;
         }
 
-        private static void DoTailCall(int callerIndex, TailCallee[] callees, TailCallEventListener tcel)
+        private static TailCallee CreateCallee(int calleeIndex)
         {
+            string name = CalleePrefix + calleeIndex;
+            Random rand = new Random(0xdadbeef + calleeIndex);
+            List<TypeEx> pms = RandomParameters(rand);
+            var tc = new TailCallee(name, pms, typeof(long));
+            return tc;
+        }
+
+        private static List<TypeEx> RandomParameters(Random rand)
+        {
+            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 7));
+            for (int j = 0; j < pms.Capacity; j++)
+                pms.Add(s_candidateArgTypes[rand.Next(s_candidateArgTypes.Length)]);
+
+            return pms;
+        }
+
+        private static bool TryTailCall(int callerIndex, List<TailCallee> callees)
+        {
+            // Use a known starting seed so we can test a single caller easily.
             Random rand = new Random(0xeadbeef + callerIndex);
             List<TypeEx> pms = RandomParameters(rand);
+            // Get candidate callees. It is a hard requirement that the caller has more stack space.
             int argStackSizeApprox = s_abi.ApproximateArgStackAreaSize(pms);
             List<TailCallee> callable = callees.Where(t => t.ArgStackSizeApprox < argStackSizeApprox).ToList();
             if (callable.Count <= 0)
-                return;
+                return true;
 
-            TailCallee callee = callable[rand.Next(callable.Count)];
+            int calleeIndex = rand.Next(callable.Count);
+            // We might not have emitted this callee yet, so do that if so.
+            if (callable[calleeIndex].Method == null)
+            {
+                callable[calleeIndex].Emit();
+                Debug.Assert(callable[calleeIndex].Method != null);
+            }
 
+            TailCallee callee = callable[calleeIndex];
+
+            // Now create the args to pass to the callee from the caller.
             List<Value> args = new List<Value>(callee.Parameters.Count);
             List<Value> candidates = new List<Value>();
             for (int j = 0; j < args.Capacity; j++)
             {
                 TypeEx targetTy = callee.Parameters[j];
+                // Collect candidate args. For each parameter to the caller we might be able to just
+                // forward it or one of its fields.
                 candidates.Clear();
                 CollectCandidateArgs(targetTy.Type, pms, candidates);
 
                 if (candidates.Count > 0)
+                {
                     args.Add(candidates[rand.Next(candidates.Count)]);
+                }
                 else
+                {
+                    // No candidates to forward, so just create a new value here dynamically.
                     args.Add(new ConstantValue(targetTy, GenConstant(targetTy.Type, targetTy.Fields, rand)));
+                }
             }
 
             DynamicMethod caller = new DynamicMethod(
@@ -90,13 +142,14 @@ namespace TailcallStress
 
             object[] outerArgs = pms.Select(t => GenConstant(t.Type, t.Fields, rand)).ToArray();
             object[] innerArgs = args.Select(v => v.Get(outerArgs)).ToArray();
-            object expectedResult = callee.ReturnedValue.Get(innerArgs);
             object result = caller.Invoke(null, outerArgs);
+            object expectedResult = callee.Method.Invoke(null, innerArgs);
 
-            if (!expectedResult.Equals(result))
-                Console.WriteLine("Mismatch {0} -> {1}", CallerPrefix + callerIndex, callee.Name);
+            if (expectedResult.Equals(result))
+                return true;
 
-            Console.WriteLine(string.Format("{0} callers seen, {1} tailcalls performed", tcel.NumCallersSeen, tcel.NumSuccessfulTailCalls));
+            Console.WriteLine("Mismatch {0} -> {1} (expected {2}, got {3})", CallerPrefix + callerIndex, callee.Name, expectedResult, result);
+            return false;
         }
 
         private static void CollectCandidateArgs(Type targetTy, List<TypeEx> pms, List<Value> candidates)
@@ -141,34 +194,6 @@ namespace TailcallStress
             return Activator.CreateInstance(type, fields.Select(fi => GenConstant(fi.FieldType, null, rand)).ToArray());
         }
 
-        private static List<TypeEx> RandomParameters(Random rand)
-        {
-            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 101));
-            for (int j = 0; j < pms.Capacity; j++)
-                pms.Add(s_candidateArgTypes[rand.Next(s_candidateArgTypes.Length)]);
-
-            return pms;
-        }
-
-        private static TailCallee CreateCallee(int calleeIndex, Random rand)
-        {
-            List<TypeEx> pms = RandomParameters(rand);
-            int argIndex = rand.Next(pms.Count);
-            Value val = new ArgValue(pms[argIndex], argIndex);
-            if (pms[argIndex].Fields != null && rand.NextDouble() < 0.5)
-                val = new FieldValue(val, rand.Next(pms[argIndex].Fields.Length));
-
-            // Create method
-            DynamicMethod method = new DynamicMethod(
-                CalleePrefix + calleeIndex, val.Type.Type, pms.Select(t => t.Type).ToArray(), typeof(Program));
-
-            ILGenerator g = method.GetILGenerator();
-            val.Emit(g);
-            g.Emit(OpCodes.Ret);
-
-            return new TailCallee(CalleePrefix + calleeIndex, pms, val.Type.Type, val, method);
-        }
-
         private static readonly IAbi s_abi = SelectAbi();
         private static readonly TypeEx[] s_candidateArgTypes =
             s_abi.CandidateArgTypes.Select(t => new TypeEx(t)).ToArray();
@@ -177,12 +202,20 @@ namespace TailcallStress
         {
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
             {
-                return IntPtr.Size == 8 ? (IAbi)new Win64Abi() : new Win86Abi();
+                if (IntPtr.Size == 8)
+                {
+                    Console.WriteLine("Selecting win64 ABI");
+                    return new Win64Abi();
+                }
+
+                Console.WriteLine("Selecting win86 ABI");
+                return new Win86Abi();
             }
 
             if (Environment.OSVersion.Platform == PlatformID.Unix)
             {
                 Trace.Assert(IntPtr.Size == 8);
+                Console.WriteLine("Selecting SysV ABI");
                 return new SysVAbi();
             }
 
@@ -191,22 +224,55 @@ namespace TailcallStress
 
         private class TailCallee
         {
-            public TailCallee(string name, List<TypeEx> parameters, Type returnType, Value returnedValue, DynamicMethod method)
+            public TailCallee(string name, List<TypeEx> parameters, Type returnType)
             {
                 Name = name;
                 Parameters = parameters;
                 ArgStackSizeApprox = s_abi.ApproximateArgStackAreaSize(Parameters);
                 ReturnType = returnType;
-                ReturnedValue = returnedValue;
-                Method = method;
             }
 
             public string Name { get; }
             public List<TypeEx> Parameters { get; }
             public int ArgStackSizeApprox { get; }
             public Type ReturnType { get; }
-            public Value ReturnedValue { get; }
-            public DynamicMethod Method { get; }
+            public DynamicMethod Method { get; private set; }
+
+            public void Emit()
+            {
+                if (Method != null)
+                    return;
+
+                Method = new DynamicMethod(
+                    Name, typeof(long), Parameters.Select(t => t.Type).ToArray(), typeof(Program));
+
+                ILGenerator g = Method.GetILGenerator();
+                g.Emit(OpCodes.Ldc_I8, (long)0);
+                for (int i = 0; i < Parameters.Count; i++)
+                {
+                    TypeEx pm = Parameters[i];
+                    ArgValue arg = new ArgValue(pm, i);
+                    if (pm.Fields == null)
+                    {
+                        arg.Emit(g);
+                        g.Emit(OpCodes.Conv_I8);
+                        g.Emit(OpCodes.Add);
+                    }
+                    else
+                    {
+                        for (int j = 0; j < pm.Fields.Length; j++)
+                        {
+                            Debug.Assert(pm.Fields[j].FieldType.IsPrimitive);
+                            new FieldValue(arg, j).Emit(g);
+                            g.Emit(OpCodes.Conv_I8);
+                            g.Emit(OpCodes.Add);
+                        }
+                    }
+
+                }
+
+                g.Emit(OpCodes.Ret);
+            }
         }
 
         private abstract class Value
@@ -234,7 +300,7 @@ namespace TailcallStress
             public override object Get(object[] args) => args[Index];
             public override void Emit(ILGenerator il)
             {
-                il.Emit(OpCodes.Ldarg, (ushort)Index);
+                il.Emit(OpCodes.Ldarg, checked((short)Index));
             }
         }
 
@@ -398,6 +464,49 @@ namespace TailcallStress
                 return size;
             }
         }
+
+        private class TailCallEventListener : EventListener
+        {
+            public int NumCallersSeen { get; set; }
+            public int NumSuccessfulTailCalls { get; set; }
+            public Dictionary<string, int> FailureReasons { get; } = new Dictionary<string, int>();
+
+            protected override void OnEventSourceCreated(EventSource eventSource)
+            {
+                if (eventSource.Name != "Microsoft-Windows-DotNETRuntime")
+                    return;
+
+                EventKeywords jitTracing = (EventKeywords)0x61098; // JITSymbols | JITTracing
+                EnableEvents(eventSource, EventLevel.Verbose, jitTracing);
+            }
+
+            protected override void OnEventWritten(EventWrittenEventArgs data)
+            {
+                string GetData(string name) => data.Payload[data.PayloadNames.IndexOf(name)].ToString();
+
+                switch (data.EventName)
+                {
+                    case "MethodJitTailCallFailed":
+                        if (GetData("MethodBeingCompiledName").StartsWith(CallerPrefix))
+                        {
+                            NumCallersSeen++;
+                            string failReason = GetData("FailReason");
+                            lock (FailureReasons)
+                            {
+                                FailureReasons[failReason] = FailureReasons.GetValueOrDefault(failReason) + 1;
+                            }
+                        }
+                        break;
+                    case "MethodJitTailCallSucceeded":
+                        if (GetData("MethodBeingCompiledName").StartsWith(CallerPrefix))
+                        {
+                            NumCallersSeen++;
+                            NumSuccessfulTailCalls++;
+                        }
+                        break;
+                }
+            }
+        }
     }
 
     // U suffix = unpromotable, P suffix = promotable by the JIT.
@@ -423,42 +532,4 @@ namespace TailcallStress
     struct S17U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16; public S17U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16); }
     struct S31U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30; public S31U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30); }
     struct S32U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31; public S32U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30, byte f31) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30, f31); }
-
-    class TailCallEventListener : EventListener
-    {
-        public int NumCallersSeen { get; set; }
-        public int NumSuccessfulTailCalls { get; set; }
-
-        protected override void OnEventSourceCreated(EventSource eventSource)
-        {
-            if (eventSource.Name != "Microsoft-Windows-DotNETRuntime")
-                return;
-
-            EventKeywords jitTracing = (EventKeywords)0x61098; // JITSymbols | JITTracing
-            EnableEvents(eventSource, EventLevel.Verbose, jitTracing);
-        }
-
-        protected override void OnEventWritten(EventWrittenEventArgs data)
-        {
-            string GetData(string name) => data.Payload[data.PayloadNames.IndexOf(name)].ToString();
-
-            switch (data.EventName)
-            {
-                case "MethodJitTailCallFailed":
-                    if (GetData("MethodBeingCompiledName").StartsWith(Program.CallerPrefix))
-                    {
-                        NumCallersSeen++;
-                        Console.WriteLine("No tailcall: {0}", GetData("FailReason"));
-                    }
-                    break;
-                case "MethodJitTailCallSucceeded":
-                    if (GetData("MethodBeingCompiledName").StartsWith(Program.CallerPrefix))
-                    {
-                        NumCallersSeen++;
-                        NumSuccessfulTailCalls++;
-                    }
-                    break;
-            }
-        }
-    }
 }
