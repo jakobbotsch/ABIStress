@@ -202,6 +202,12 @@ namespace TailcallStress
             if (type == typeof(long))
                 return ((long)rand.Next() << 32) | (uint)rand.Next();
 
+            if (type == typeof(float))
+                return (float)rand.Next(short.MaxValue);
+
+            if (type == typeof(double))
+                return (double)rand.Next();
+
             Debug.Assert(fields != null);
             return Activator.CreateInstance(type, fields.Select(fi => GenConstant(fi.FieldType, null, rand)).ToArray());
         }
@@ -376,6 +382,10 @@ namespace TailcallStress
                     il.Emit(OpCodes.Ldc_I4, (int)val);
                 else if (ty == typeof(long))
                     il.Emit(OpCodes.Ldc_I8, (long)val);
+                else if (ty == typeof(float))
+                    il.Emit(OpCodes.Ldc_R4, (float)val);
+                else if (ty == typeof(double))
+                    il.Emit(OpCodes.Ldc_R8, (double)val);
                 else
                     throw new NotSupportedException("Other primitives are currently not supported");
             }
@@ -412,6 +422,7 @@ namespace TailcallStress
                 new[]
                 {
                     typeof(byte), typeof(short), typeof(int), typeof(long),
+                    typeof(float), typeof(double),
                     typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
                     typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
                     typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
@@ -438,8 +449,9 @@ namespace TailcallStress
                 new[]
                 {
                     typeof(byte), typeof(short), typeof(int), typeof(long),
+                    typeof(float), typeof(double),
                     typeof(S1P), typeof(S2P), typeof(S2U), typeof(S4P),
-                    typeof(S4U), typeof(S8P), typeof(S8U)
+                    typeof(S4U), typeof(S8P), typeof(S8U),
                 };
 
             public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
@@ -459,6 +471,7 @@ namespace TailcallStress
                 new[]
                 {
                     typeof(byte), typeof(short), typeof(int), typeof(long),
+                    typeof(float), typeof(double),
                     typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
                     typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
                     typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
