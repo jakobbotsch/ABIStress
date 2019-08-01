@@ -70,7 +70,7 @@ namespace TailcallStress
                     int numRejected = tcel.FailureReasons.Values.Sum();
                     Console.WriteLine("{0} rejected tailcalls. Breakdown:", numRejected);
                     foreach (var (reason, count) in tcel.FailureReasons.OrderByDescending(kvp => kvp.Value))
-                        Console.WriteLine("[{0:00.00}]: {1}", count / (double)numRejected * 100, reason);
+                        Console.WriteLine("[{0:00.00}%]: {1}", count / (double)numRejected * 100, reason);
                 }
             }
 
