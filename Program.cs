@@ -460,6 +460,8 @@ namespace TailcallStress
                 foreach (TypeEx pm in parameters)
                     size += (pm.Size + 7) & ~7;
 
+                // On win64 there's always 32 bytes of stack space allocated.
+                size = Math.Max(size, 32);
                 return size;
             }
         }
