@@ -436,7 +436,7 @@ namespace TailcallStress
                 if (!t.IsOurStructType())
                     return;
 
-                Fields = t.GetFields().OrderBy(f => f.Name).ToArray();
+                Fields = Enumerable.Range(0, 10000).Select(i => t.GetField($"F{i}")).TakeWhile(fi => fi != null).ToArray();
                 Ctor = t.GetConstructor(Fields.Select(f => f.FieldType).ToArray());
             }
         }
@@ -599,6 +599,7 @@ namespace TailcallStress
     }
 
     // U suffix = unpromotable, P suffix = promotable by the JIT.
+    // Note that fields must be named Fi with i sequential.
     struct S1P { public byte F0; public S1P(byte f0) => F0 = f0; }
     struct S2P { public short F0; public S2P(short f0) => F0 = f0; }
     struct S2U { public byte F0, F1; public S2U(byte f0, byte f1) => (F0, F1) = (f0, f1); }
