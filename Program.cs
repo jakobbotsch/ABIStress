@@ -83,7 +83,7 @@ namespace TailcallStress
             string name = CalleePrefix + calleeIndex;
             Random rand = new Random(0xdadbeef + calleeIndex);
             List<TypeEx> pms = RandomParameters(rand);
-            var tc = new TailCallee(name, pms, typeof(long));
+            var tc = new TailCallee(name, pms);
             return tc;
         }
 
@@ -140,7 +140,7 @@ namespace TailcallStress
             }
 
             DynamicMethod caller = new DynamicMethod(
-                CallerPrefix + callerIndex, callee.ReturnType, pms.Select(t => t.Type).ToArray(), typeof(Program).Module);
+                CallerPrefix + callerIndex, typeof(int), pms.Select(t => t.Type).ToArray(), typeof(Program).Module);
 
             ILGenerator g = caller.GetILGenerator();
             for (int j = 0; j < args.Count; j++)
@@ -269,18 +269,21 @@ namespace TailcallStress
 
         private class TailCallee
         {
-            public TailCallee(string name, List<TypeEx> parameters, Type returnType)
+            private static readonly MethodInfo s_hashCodeAddMethod =
+                typeof(HashCode).GetMethods().Single(mi => mi.Name == "Add" && mi.GetParameters().Length == 1);
+            private static readonly MethodInfo s_hashCodeToHashCodeMethod =
+                typeof(HashCode).GetMethod("ToHashCode");
+
+            public TailCallee(string name, List<TypeEx> parameters)
             {
                 Name = name;
                 Parameters = parameters;
                 ArgStackSizeApprox = s_abi.ApproximateArgStackAreaSize(Parameters);
-                ReturnType = returnType;
             }
 
             public string Name { get; }
             public List<TypeEx> Parameters { get; }
             public int ArgStackSizeApprox { get; }
-            public Type ReturnType { get; }
             public DynamicMethod Method { get; private set; }
 
             public void Emit()
@@ -289,48 +292,23 @@ namespace TailcallStress
                     return;
 
                 Method = new DynamicMethod(
-                    Name, typeof(long), Parameters.Select(t => t.Type).ToArray(), typeof(Program));
+                    Name, typeof(int), Parameters.Select(t => t.Type).ToArray(), typeof(Program));
 
                 ILGenerator g = Method.GetILGenerator();
-                g.Emit(OpCodes.Ldc_I8, (long)0);
+                LocalBuilder hashCode = g.DeclareLocal(typeof(HashCode));
+                g.Emit(OpCodes.Ldloca, hashCode);
+                g.Emit(OpCodes.Initobj, typeof(HashCode));
+
                 for (int i = 0; i < Parameters.Count; i++)
                 {
                     TypeEx pm = Parameters[i];
-                    ArgValue arg = new ArgValue(pm, i);
-                    if (pm.Fields != null)
-                    {
-                        for (int j = 0; j < pm.Fields.Length; j++)
-                        {
-                            Debug.Assert(pm.Fields[j].FieldType.IsPrimitive);
-                            new FieldValue(arg, j).Emit(g);
-                            g.Emit(OpCodes.Conv_I8);
-                            g.Emit(OpCodes.Add);
-                        }
-
-                        continue;
-                    }
-
-                    if (pm.Type.IsGenericType && pm.Type.GetGenericTypeDefinition() == typeof(Vector<>))
-                    {
-                        int numFields = (int)pm.Type.GetProperty("Count").GetValue(null);
-                        MethodInfo indexer = pm.Type.GetMethod("get_Item");
-                        for (int j = 0; j < numFields; j++)
-                        {
-                            g.Emit(OpCodes.Ldarga, checked((short)i));
-                            g.Emit(OpCodes.Ldc_I4, j);
-                            g.EmitCall(OpCodes.Call, indexer, null);
-                            g.Emit(OpCodes.Conv_I8);
-                            g.Emit(OpCodes.Add);
-                        }
-
-                        continue;
-                    }
-
-                    arg.Emit(g);
-                    g.Emit(OpCodes.Conv_I8);
-                    g.Emit(OpCodes.Add);
+                    g.Emit(OpCodes.Ldloca, hashCode);
+                    g.Emit(OpCodes.Ldarg, checked((short)i));
+                    g.Emit(OpCodes.Call, s_hashCodeAddMethod.MakeGenericMethod(pm.Type));
                 }
 
+                g.Emit(OpCodes.Ldloca, hashCode);
+                g.Emit(OpCodes.Call, s_hashCodeToHashCodeMethod);
                 g.Emit(OpCodes.Ret);
             }
         }
