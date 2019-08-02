@@ -16,6 +16,7 @@ namespace TailcallStress
 {
     internal class Program
     {
+        internal static bool s_verbose;
         internal const string CallerPrefix = "TCStress_Caller";
         internal const string CalleePrefix = "TCStress_Callee";
 
@@ -30,8 +31,10 @@ namespace TailcallStress
             using var tcel = new TailCallEventListener();
 
             int mismatches = 0;
-            if (args.Length > 0 && int.TryParse(args[0], out int index))
+            if (args.Length >= 1 && int.TryParse(args[0], out int index))
             {
+                s_verbose = args.Length >= 2 && args[1].Equals("verbose", StringComparison.OrdinalIgnoreCase);
+
                 if (!TryTailCall(index, callees))
                     mismatches++;
             }
@@ -89,6 +92,8 @@ namespace TailcallStress
 
         private static bool TryTailCall(int callerIndex, List<TailCallee> callees)
         {
+            string callerName = CallerPrefix + callerIndex;
+
             // Use a known starting seed so we can test a single caller easily.
             Random rand = new Random(0xeadbeef + callerIndex);
             List<TypeEx> pms = RandomParameters(rand);
@@ -107,6 +112,13 @@ namespace TailcallStress
             }
 
             TailCallee callee = callable[calleeIndex];
+
+            if (s_verbose)
+            {
+                Console.WriteLine("{0} -> {1}", callerName, callee.Name);
+                Console.WriteLine("Caller signature: {0}", string.Join(", ", pms.Select(pm => pm.Type.Name)));
+                Console.WriteLine("Callee signature: {0}", string.Join(", ", callee.Parameters.Select(pm => pm.Type.Name)));
+            }
 
             // Now create the args to pass to the callee from the caller.
             List<Value> args = new List<Value>(callee.Parameters.Count);
@@ -131,9 +143,15 @@ namespace TailcallStress
             }
 
             DynamicMethod caller = new DynamicMethod(
-                CallerPrefix + callerIndex, typeof(int), pms.Select(t => t.Type).ToArray(), typeof(Program).Module);
+                callerName, typeof(int), pms.Select(t => t.Type).ToArray(), typeof(Program).Module);
 
             ILGenerator g = caller.GetILGenerator();
+            if (s_verbose)
+            {
+                EmitDumpArgList(g, pms, j => g.Emit(OpCodes.Ldarg, checked((short)j)), "Caller incoming args");
+                EmitDumpArgList(g, args.Select(a => a.Type), j => args[j].Emit(g), "Caller passing args");
+            }
+
             for (int j = 0; j < args.Count; j++)
                 args[j].Emit(g);
 
@@ -143,14 +161,34 @@ namespace TailcallStress
 
             object[] outerArgs = pms.Select(t => GenConstant(t.Type, t.Fields, rand)).ToArray();
             object[] innerArgs = args.Select(v => v.Get(outerArgs)).ToArray();
+
+            if (s_verbose)
+            {
+                Console.WriteLine("Invoking caller through reflection with args");
+                for (int j = 0; j < outerArgs.Length; j++)
+                {
+                    Console.Write($"arg{j}=");
+                    DumpObject(outerArgs[j]);
+                }
+            }
             object result = caller.Invoke(null, outerArgs);
+
+            if (s_verbose)
+            {
+                Console.WriteLine("Invoking callee through reflection with args");
+                for (int j = 0; j < innerArgs.Length; j++)
+                {
+                    Console.Write($"arg{j}=");
+                    DumpObject(innerArgs[j]);
+                }
+            }
             object expectedResult = callee.Method.Invoke(null, innerArgs);
 
             if (expectedResult.Equals(result))
                 return true;
 
             Console.WriteLine("Mismatch {0} ({1} params) -> {2} ({3} params) (expected {4}, got {5})",
-                CallerPrefix + callerIndex, pms.Count,
+                callerName, pms.Count,
                 callee.Name, callee.Parameters.Count,
                 expectedResult, result);
             return false;
@@ -217,6 +255,53 @@ namespace TailcallStress
 
             Debug.Assert(fields != null);
             return Activator.CreateInstance(type, fields.Select(fi => GenConstant(fi.FieldType, null, rand)).ToArray());
+        }
+
+        private static readonly MethodInfo s_writeString = typeof(Console).GetMethod("Write", new[] { typeof(string) });
+        private static readonly MethodInfo s_writeLineString = typeof(Console).GetMethod("WriteLine", new[] { typeof(string) });
+        private static readonly MethodInfo s_dumpValue = typeof(Program).GetMethod("DumpValue", BindingFlags.NonPublic | BindingFlags.Static);
+
+        private static void DumpObject(object o)
+        {
+            TypeEx ty = new TypeEx(o.GetType());
+            if (ty.Fields != null)
+            {
+                Console.WriteLine();
+                foreach (FieldInfo field in ty.Fields)
+                    Console.WriteLine("  {0}={1}", field.Name, field.GetValue(o));
+
+                return;
+            }
+
+            Console.WriteLine(o);
+        }
+
+        private static void DumpValue<T>(T value)
+        {
+            DumpObject(value);
+        }
+
+        // Dumps the value on the top of the stack, consuming the value.
+        private static void EmitDumpValue(ILGenerator g, TypeEx ty)
+        {
+            MethodInfo instantiated = s_dumpValue.MakeGenericMethod(ty.Type);
+            g.Emit(OpCodes.Call, instantiated);
+        }
+
+        private static void EmitDumpArgList(ILGenerator g, IEnumerable<TypeEx> types, Action<int> emitPlaceValue, string listName)
+        {
+            g.Emit(OpCodes.Ldstr, $"{listName}:");
+            g.Emit(OpCodes.Call, s_writeLineString);
+            int index = 0;
+            foreach (TypeEx ty in types)
+            {
+                g.Emit(OpCodes.Ldstr, $"arg{index}=");
+                g.Emit(OpCodes.Call, s_writeString);
+
+                emitPlaceValue(index);
+                EmitDumpValue(g, ty);
+                index++;
+            }
         }
 
         private static readonly IAbi s_abi = SelectAbi();
@@ -287,6 +372,10 @@ namespace TailcallStress
 
                 ILGenerator g = Method.GetILGenerator();
                 LocalBuilder hashCode = g.DeclareLocal(typeof(HashCode));
+
+                if (s_verbose)
+                    EmitDumpArgList(g, Parameters, i => g.Emit(OpCodes.Ldarg, checked((short)i)), "Callee incoming parameters");
+
                 g.Emit(OpCodes.Ldloca, hashCode);
                 g.Emit(OpCodes.Initobj, typeof(HashCode));
 
