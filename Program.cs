@@ -234,6 +234,10 @@ namespace TailcallStress
 
         private static IAbi SelectAbi()
         {
+            Console.WriteLine("OSVersion: {0}", Environment.OSVersion);
+            Console.WriteLine("OSArchitecture: {0}", RuntimeInformation.OSArchitecture);
+            Console.WriteLine("ProcessArchitecture: {0}", RuntimeInformation.ProcessArchitecture);
+
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
             {
                 if (IntPtr.Size == 8)
@@ -248,7 +252,14 @@ namespace TailcallStress
 
             if (Environment.OSVersion.Platform == PlatformID.Unix)
             {
-                Trace.Assert(IntPtr.Size == 8);
+                Trace.Assert(IntPtr.Size == 8, "Expected 64-bit process on Unix");
+                if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
+                {
+                    Console.WriteLine("Selecting ARM64 ABI");
+                    return new Arm64Abi();
+                }
+
+                Trace.Assert(RuntimeInformation.ProcessArchitecture == Architecture.X64);
                 Console.WriteLine("Selecting SysV ABI");
                 return new SysVAbi();
             }
@@ -545,6 +556,35 @@ namespace TailcallStress
             }
         }
 
+        private class Arm64Abi : IAbi
+        {
+            // For Arm64 everything can be passed everything by value.
+            public Type[] CandidateArgTypes { get; } =
+                new[]
+                {
+                    typeof(byte), typeof(short), typeof(int), typeof(long),
+                    typeof(float), typeof(double),
+                    typeof(Vector<int>), typeof(Vector<long>),
+                    typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
+                    typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
+                    typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
+                    typeof(S10U), typeof(S11U), typeof(S12U), typeof(S13U),
+                    typeof(S14U), typeof(S15U), typeof(S16U), typeof(S17U),
+                    typeof(S31U), typeof(S32U),
+                    typeof(Hfa1), typeof(Hfa2),
+                };
+
+            public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
+            {
+                int size = 0;
+                foreach (TypeEx pm in parameters)
+                    size += (pm.Size + 7) & ~7;
+
+                return size;
+            }
+        }
+
+
         private class TailCallEventListener : EventListener
         {
             public int NumCallersSeen { get; set; }
@@ -612,6 +652,8 @@ namespace TailcallStress
     struct S17U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16; public S17U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16); }
     struct S31U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30; public S31U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30); }
     struct S32U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31; public S32U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30, byte f31) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30, f31); }
+    struct Hfa1 { public float F0, F1; public Hfa1(float f0, float f1) => (F0, F1) = (f0, f1); }
+    struct Hfa2 { public double F0, F1, F2, F3; public Hfa2(double f0, double f1, double f2, double f3) => (F0, F1, F2, F3) = (f0, f1, f2, f3); }
 
     internal static class TypeExtensions
     {
@@ -628,7 +670,8 @@ namespace TailcallStress
                 t == typeof(S12U) || t == typeof(S13U) ||
                 t == typeof(S14U) || t == typeof(S15U) ||
                 t == typeof(S16U) || t == typeof(S17U) ||
-                t == typeof(S31U) || t == typeof(S32U);
+                t == typeof(S31U) || t == typeof(S32U) ||
+                t == typeof(Hfa1) || t == typeof(Hfa2);
         }
     }
 }
