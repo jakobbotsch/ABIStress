@@ -44,15 +44,6 @@ namespace TailcallStress
                     abortLoop = true;
                 };
 
-                // Seed 527 is a case that looks like the following:
-                // caller(S32 erStack1) -> callee(S16 eeStack1, S32 eeStack2)
-                // Here caller just forwards erStack1 as the second arg. On Unix64
-                // This means that it needs to _move_ erStack1 16 bytes ahead on the stack.
-                // Codegen does not handle disjoint overlapping copies, so we need to introduce
-                // a temp. Usually this would happen when we see the PUTARG_STK for the first
-                // arg, but in this particular case the PUTARG_STK for the second arg comes first.
-                TryTailCall(527, callees);
-
                 for (int i = 0; i < 1000000 && !abortLoop; i++)
                 {
                     if (!TryTailCall(i, callees))
