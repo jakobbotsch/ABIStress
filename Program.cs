@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.Linq;
+using System.Numerics;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.InteropServices;
@@ -188,6 +189,15 @@ namespace TailcallStress
             }
         }
 
+        private static Vector<T> GenConstantVector<T>(Random rand) where T : struct
+        {
+            T[] elements = new T[Vector<T>.Count];
+            for (int i = 0; i < elements.Length; i++)
+                elements[i] = (T)GenConstant(typeof(T), null, rand);
+
+            return new Vector<T>(elements);
+        }
+
         private static object GenConstant(Type type, FieldInfo[] fields, Random rand)
         {
             if (type == typeof(byte))
@@ -207,6 +217,12 @@ namespace TailcallStress
 
             if (type == typeof(double))
                 return (double)rand.Next();
+
+            if (type == typeof(Vector<int>))
+                return GenConstantVector<int>(rand);
+
+            if (type == typeof(Vector<long>))
+                return GenConstantVector<long>(rand);
 
             Debug.Assert(fields != null);
             return Activator.CreateInstance(type, fields.Select(fi => GenConstant(fi.FieldType, null, rand)).ToArray());
@@ -270,13 +286,7 @@ namespace TailcallStress
                 {
                     TypeEx pm = Parameters[i];
                     ArgValue arg = new ArgValue(pm, i);
-                    if (pm.Fields == null)
-                    {
-                        arg.Emit(g);
-                        g.Emit(OpCodes.Conv_I8);
-                        g.Emit(OpCodes.Add);
-                    }
-                    else
+                    if (pm.Fields != null)
                     {
                         for (int j = 0; j < pm.Fields.Length; j++)
                         {
@@ -285,8 +295,29 @@ namespace TailcallStress
                             g.Emit(OpCodes.Conv_I8);
                             g.Emit(OpCodes.Add);
                         }
+
+                        continue;
                     }
 
+                    if (pm.Type.IsGenericType && pm.Type.GetGenericTypeDefinition() == typeof(Vector<>))
+                    {
+                        int numFields = (int)pm.Type.GetProperty("Count").GetValue(null);
+                        MethodInfo indexer = pm.Type.GetMethod("get_Item");
+                        for (int j = 0; j < numFields; j++)
+                        {
+                            g.Emit(OpCodes.Ldarga, checked((short)i));
+                            g.Emit(OpCodes.Ldc_I4, j);
+                            g.EmitCall(OpCodes.Call, indexer, null);
+                            g.Emit(OpCodes.Conv_I8);
+                            g.Emit(OpCodes.Add);
+                        }
+
+                        continue;
+                    }
+
+                    arg.Emit(g);
+                    g.Emit(OpCodes.Conv_I8);
+                    g.Emit(OpCodes.Add);
                 }
 
                 g.Emit(OpCodes.Ret);
@@ -371,6 +402,22 @@ namespace TailcallStress
                 il.Emit(OpCodes.Newobj, Type.Ctor);
             }
 
+            private static void EmitLoadVector<T>(ILGenerator il, Vector<T> val) where T : struct
+            {
+                il.Emit(OpCodes.Ldc_I4, Vector<T>.Count);
+                il.Emit(OpCodes.Newarr, typeof(T));
+                for (int i = 0; i < Vector<T>.Count; i++)
+                {
+                    il.Emit(OpCodes.Dup);
+                    il.Emit(OpCodes.Ldc_I4, i);
+                    EmitLoadPrimitive(il, val[i]);
+                    il.Emit(OpCodes.Stelem, typeof(T));
+                }
+
+                ConstructorInfo ctor = typeof(Vector<T>).GetConstructor(new[] { typeof(T[]) });
+                il.Emit(OpCodes.Newobj, ctor);
+            }
+
             private static void EmitLoadPrimitive(ILGenerator il, object val)
             {
                 Type ty = val.GetType();
@@ -386,6 +433,10 @@ namespace TailcallStress
                     il.Emit(OpCodes.Ldc_R4, (float)val);
                 else if (ty == typeof(double))
                     il.Emit(OpCodes.Ldc_R8, (double)val);
+                else if (ty == typeof(Vector<int>))
+                    EmitLoadVector(il, (Vector<int>)val);
+                else if (ty == typeof(Vector<long>))
+                    EmitLoadVector(il, (Vector<long>)val);
                 else
                     throw new NotSupportedException("Other primitives are currently not supported");
             }
@@ -401,8 +452,8 @@ namespace TailcallStress
             public TypeEx(Type t)
             {
                 Type = t;
-                Size = Marshal.SizeOf(t);
-                if (t.IsPrimitive)
+                Size = Marshal.SizeOf(Activator.CreateInstance(t));
+                if (!t.IsOurStructType())
                     return;
 
                 Fields = t.GetFields().OrderBy(f => f.Name).ToArray();
@@ -423,6 +474,7 @@ namespace TailcallStress
                 {
                     typeof(byte), typeof(short), typeof(int), typeof(long),
                     typeof(float), typeof(double),
+                    typeof(Vector<int>), typeof(Vector<long>),
                     typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
                     typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
                     typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
@@ -474,6 +526,7 @@ namespace TailcallStress
                 {
                     typeof(byte), typeof(short), typeof(int), typeof(long),
                     typeof(float), typeof(double),
+                    typeof(Vector<int>), typeof(Vector<long>),
                     typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
                     typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
                     typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
@@ -559,4 +612,23 @@ namespace TailcallStress
     struct S17U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16; public S17U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16); }
     struct S31U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30; public S31U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30); }
     struct S32U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31; public S32U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30, byte f31) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30, f31); }
+
+    internal static class TypeExtensions
+    {
+        public static bool IsOurStructType(this Type t)
+        {
+            return
+                t == typeof(S1P) || t == typeof(S2P) ||
+                t == typeof(S2U) || t == typeof(S3U) ||
+                t == typeof(S4P) || t == typeof(S4U) ||
+                t == typeof(S5U) || t == typeof(S6U) ||
+                t == typeof(S7U) || t == typeof(S8P) ||
+                t == typeof(S8U) || t == typeof(S9U) ||
+                t == typeof(S10U) || t == typeof(S11U) ||
+                t == typeof(S12U) || t == typeof(S13U) ||
+                t == typeof(S14U) || t == typeof(S15U) ||
+                t == typeof(S16U) || t == typeof(S17U) ||
+                t == typeof(S31U) || t == typeof(S32U);
+        }
+    }
 }
