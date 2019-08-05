@@ -9,6 +9,7 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -171,7 +172,8 @@ namespace TailcallStress
                     DumpObject(outerArgs[j]);
                 }
             }
-            object result = caller.Invoke(null, outerArgs);
+            object result = InvokeMethodDynamicallyButWithoutReflection(caller, outerArgs);
+            //object result = caller.Invoke(null, outerArgs);
 
             if (s_verbose)
             {
@@ -182,7 +184,8 @@ namespace TailcallStress
                     DumpObject(innerArgs[j]);
                 }
             }
-            object expectedResult = callee.Method.Invoke(null, innerArgs);
+            //object expectedResult = callee.Method.Invoke(null, innerArgs);
+            object expectedResult = InvokeMethodDynamicallyButWithoutReflection(callee.Method, innerArgs);
 
             if (expectedResult.Equals(result))
                 return true;
@@ -192,6 +195,24 @@ namespace TailcallStress
                 callee.Name, callee.Parameters.Count,
                 expectedResult, result);
             return false;
+        }
+
+        // This function works around a reflection bug on ARM64:
+        // https://github.com/dotnet/coreclr/issues/25993
+        private static object InvokeMethodDynamicallyButWithoutReflection(MethodInfo mi, object[] args)
+        {
+            DynamicMethod dynCaller = new DynamicMethod(
+                $"DynCaller", typeof(object), new Type[0], typeof(Program).Module);
+
+            ILGenerator g = dynCaller.GetILGenerator();
+            foreach (var arg in args)
+                new ConstantValue(new TypeEx(arg.GetType()), arg).Emit(g);
+
+            g.Emit(OpCodes.Call, mi);
+            g.Emit(OpCodes.Box, mi.ReturnType);
+            g.Emit(OpCodes.Ret);
+            Func<object> f = (Func<object>)dynCaller.CreateDelegate(typeof(Func<object>));
+            return f();
         }
 
         private static void CollectCandidateArgs(Type targetTy, List<TypeEx> pms, List<Value> candidates)
