@@ -1,42 +1,54 @@
-﻿using Microsoft.VisualBasic;
-using Microsoft.VisualBasic.CompilerServices;
-using System;
-using System.Collections;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.Tracing;
 using System.Linq;
-using System.Numerics;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
+using System.Reflection.Metadata;
 using System.Runtime.InteropServices;
-using System.Threading;
+using System.Runtime.Loader;
 
-namespace TailcallStress
+namespace ABIStress
 {
     internal class Program
     {
-        internal static bool s_verbose;
-        internal const string CallerPrefix = "TCStress_Caller";
-        internal const string CalleePrefix = "TCStress_Callee";
-
         private static int Main(string[] args)
         {
-            // Create callees. We do not emit the bodies yet, but we do need the parameter lists.
-            // These will be used to select appopriate callees when generating callers below, making
-            // sure that each caller has more stack arg space than each callee.
-            const int numCallees = 10000;
-            List<TailCallee> callees = Enumerable.Range(0, numCallees).Select(CreateCallee).ToList();
+            void Usage()
+            {
+                Console.WriteLine("Usage: [--caller-index <number>] [--num-calls <number>] [--verbose]");
+                Console.WriteLine("Either --caller-index or --num-calls must be specified.");
+            }
+
+            if (args.Contains("-help") || args.Contains("--help") || args.Contains("-h"))
+            {
+                Usage();
+                return 1;
+            }
+
+            Config.Verbose = args.Contains("--verbose");
+            int callerIndex = -1;
+            int numCalls = -1;
+            int argIndex;
+            if ((argIndex = Array.IndexOf(args, "--caller-index")) != -1)
+                callerIndex = int.Parse(args[argIndex + 1]);
+            if ((argIndex = Array.IndexOf(args, "--num-calls")) != -1)
+                numCalls = int.Parse(args[argIndex + 1]);
+
+            if ((callerIndex == -1) == (numCalls == -1))
+            {
+                Usage();
+                return 1;
+            }
+
+            List<Callee> callees = CreateCallees(Config.NumCallees);
 
             using var tcel = new TailCallEventListener();
 
             int mismatches = 0;
-            if (args.Length >= 1 && int.TryParse(args[0], out int index))
+            if (callerIndex != -1)
             {
-                s_verbose = args.Length >= 2 && args[1].Equals("verbose", StringComparison.OrdinalIgnoreCase);
-
-                if (!TryTailCall(index, callees))
+                if (!DoCall(callerIndex, callees))
                     mismatches++;
             }
             else
@@ -48,13 +60,13 @@ namespace TailcallStress
                     abortLoop = true;
                 };
 
-                for (int i = 0; i < 1000000 && !abortLoop; i++)
+                for (int i = 0; i < numCalls && !abortLoop; i++)
                 {
-                    if (!TryTailCall(i, callees))
+                    if (!DoCall(i, callees))
                         mismatches++;
 
                     if (i % 50 == 0)
-                        Console.Title = $"{tcel.NumCallersSeen} callers emitted, {tcel.NumSuccessfulTailCalls} tailcalls tested";
+                        Console.WriteLine($"{tcel.NumCallersSeen} callers emitted, {tcel.NumSuccessfulTailCalls} tailcalls tested");
                 }
             }
 
@@ -73,34 +85,41 @@ namespace TailcallStress
             return 100 + mismatches;
         }
 
-        private static TailCallee CreateCallee(int calleeIndex)
+        private static List<Callee> CreateCallees(int count)
         {
-            string name = CalleePrefix + calleeIndex;
-            Random rand = new Random(0xdadbeef + calleeIndex);
+            List<Callee> callees = Enumerable.Range(0, count).Select(CreateCallee).ToList();
+            return callees;
+        }
+
+        private static Callee CreateCallee(int calleeIndex)
+        {
+            string name = Config.CalleePrefix + calleeIndex;
+            Random rand = new Random(Config.Seed - calleeIndex);
             List<TypeEx> pms = RandomParameters(rand);
-            var tc = new TailCallee(name, pms);
+            var tc = new Callee(name, pms);
             return tc;
         }
 
         private static List<TypeEx> RandomParameters(Random rand)
         {
-            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 25));
+            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 7));
             for (int j = 0; j < pms.Capacity; j++)
                 pms.Add(s_candidateArgTypes[rand.Next(s_candidateArgTypes.Length)]);
 
             return pms;
         }
 
-        private static bool TryTailCall(int callerIndex, List<TailCallee> callees)
+        private static readonly List<DynamicMethod> s_keepRooted = new List<DynamicMethod>();
+        private static bool DoCall(int callerIndex, List<Callee> callees)
         {
-            string callerName = CallerPrefix + callerIndex;
+            string callerName = Config.CallerPrefix + callerIndex;
 
             // Use a known starting seed so we can test a single caller easily.
-            Random rand = new Random(0xeadbeef + callerIndex);
+            Random rand = new Random(Config.Seed + callerIndex);
             List<TypeEx> pms = RandomParameters(rand);
             // Get candidate callees. It is a hard requirement that the caller has more stack space.
             int argStackSizeApprox = s_abi.ApproximateArgStackAreaSize(pms);
-            List<TailCallee> callable = callees.Where(t => t.ArgStackSizeApprox < argStackSizeApprox).ToList();
+            List<Callee> callable = callees.Where(t => t.ArgStackSizeApprox < argStackSizeApprox).ToList();
             if (callable.Count <= 0)
                 return true;
 
@@ -112,14 +131,17 @@ namespace TailcallStress
                 Debug.Assert(callable[calleeIndex].Method != null);
             }
 
-            TailCallee callee = callable[calleeIndex];
+            Callee callee = callable[calleeIndex];
 
-            if (s_verbose)
+            void DumpCallerToCalleeInfo()
             {
                 Console.WriteLine("{0} -> {1}", callerName, callee.Name);
                 Console.WriteLine("Caller signature: {0}", string.Join(", ", pms.Select(pm => pm.Type.Name)));
                 Console.WriteLine("Callee signature: {0}", string.Join(", ", callee.Parameters.Select(pm => pm.Type.Name)));
             }
+
+            if (Config.Verbose)
+                DumpCallerToCalleeInfo();
 
             // Now create the args to pass to the callee from the caller.
             List<Value> args = new List<Value>(callee.Parameters.Count);
@@ -139,19 +161,56 @@ namespace TailcallStress
                 else
                 {
                     // No candidates to forward, so just create a new value here dynamically.
-                    args.Add(new ConstantValue(targetTy, GenConstant(targetTy.Type, targetTy.Fields, rand)));
+                    args.Add(new ConstantValue(targetTy, Gen.GenConstant(targetTy.Type, targetTy.Fields, rand)));
                 }
             }
 
+            // We test both calls through calli and a tailcall. To record the results of calli, we pass a
+            // int[] as the last arg where the caller will record the results.
+            Type[] finalParams = pms.Select(t => t.Type).Concat(new[] { typeof(int[]) }).ToArray();
             DynamicMethod caller = new DynamicMethod(
-                callerName, typeof(int), pms.Select(t => t.Type).ToArray(), typeof(Program).Module);
+                callerName, typeof(int), finalParams, typeof(Program).Module);
+
+            // We need to keep callers rooted due to a stale cache bug in the runtime.
+            s_keepRooted.Add(caller);
 
             ILGenerator g = caller.GetILGenerator();
-            if (s_verbose)
+            if (Config.Verbose)
             {
                 EmitDumpArgList(g, pms, j => g.Emit(OpCodes.Ldarg, checked((short)j)), "Caller incoming args");
-                EmitDumpArgList(g, args.Select(a => a.Type), j => args[j].Emit(g), "Caller passing args");
             }
+
+            // Emit pinvoke calls for each calling convention. Keep delegates rooted.
+            LocalBuilder resultLocal = g.DeclareLocal(typeof(int));
+            List<Delegate> delegates = new List<Delegate>();
+            int resultIndex = 0;
+            foreach (var (cc, delegateType) in callee.DelegateTypes)
+            {
+                Delegate dlg = callee.Method.CreateDelegate(delegateType);
+                delegates.Add(dlg);
+
+                if (Config.Verbose)
+                    EmitDumpArgList(g, args.Select(a => a.Type), j => args[j].Emit(g), $"Caller passing args to {cc} calli");
+
+                for (int j = 0; j < args.Count; j++)
+                    args[j].Emit(g);
+
+                IntPtr ptr = Marshal.GetFunctionPointerForDelegate(dlg);
+                g.Emit(OpCodes.Ldc_I8, (long)ptr);
+                g.Emit(OpCodes.Conv_I);
+                g.EmitCalli(OpCodes.Calli, cc, typeof(int), callee.Parameters.Select(p => p.Type).ToArray());
+                g.Emit(OpCodes.Stloc, resultLocal);
+
+                g.Emit(OpCodes.Ldarg, (short)(finalParams.Length - 1)); // reference to int[]
+                g.Emit(OpCodes.Ldc_I4, resultIndex); // where to store result
+                g.Emit(OpCodes.Ldloc, resultLocal); // result
+                g.Emit(OpCodes.Stelem_I4);
+                resultIndex++;
+            }
+
+            // Finally do tailcall.
+            if (Config.Verbose)
+                EmitDumpArgList(g, args.Select(a => a.Type), j => args[j].Emit(g), "Caller passing args to tailcall");
 
             for (int j = 0; j < args.Count; j++)
                 args[j].Emit(g);
@@ -160,10 +219,10 @@ namespace TailcallStress
             g.EmitCall(OpCodes.Call, callee.Method, null);
             g.Emit(OpCodes.Ret);
 
-            object[] outerArgs = pms.Select(t => GenConstant(t.Type, t.Fields, rand)).ToArray();
+            object[] outerArgs = pms.Select(t => Gen.GenConstant(t.Type, t.Fields, rand)).ToArray();
             object[] innerArgs = args.Select(v => v.Get(outerArgs)).ToArray();
 
-            if (s_verbose)
+            if (Config.Verbose)
             {
                 Console.WriteLine("Invoking caller through reflection with args");
                 for (int j = 0; j < outerArgs.Length; j++)
@@ -172,10 +231,11 @@ namespace TailcallStress
                     DumpObject(outerArgs[j]);
                 }
             }
-            object result = InvokeMethodDynamicallyButWithoutReflection(caller, outerArgs);
+            int[] pinvokeResult = new int[callee.DelegateTypes.Count];
+            object result = InvokeMethodDynamicallyButWithoutReflection(caller, outerArgs, pinvokeResult);
             //object result = caller.Invoke(null, outerArgs);
 
-            if (s_verbose)
+            if (Config.Verbose)
             {
                 Console.WriteLine("Invoking callee through reflection with args");
                 for (int j = 0; j < innerArgs.Length; j++)
@@ -185,34 +245,51 @@ namespace TailcallStress
                 }
             }
             //object expectedResult = callee.Method.Invoke(null, innerArgs);
-            object expectedResult = InvokeMethodDynamicallyButWithoutReflection(callee.Method, innerArgs);
+            object expectedResult = InvokeMethodDynamicallyButWithoutReflection(callee.Method, innerArgs, null);
 
-            if (expectedResult.Equals(result))
-                return true;
+            GC.KeepAlive(delegates);
 
-            Console.WriteLine("Mismatch {0} ({1} params) -> {2} ({3} params) (expected {4}, got {5})",
-                callerName, pms.Count,
-                callee.Name, callee.Parameters.Count,
-                expectedResult, result);
-            return false;
+            bool allCorrect = true;
+            for (int i = 0; i < pinvokeResult.Length + 1; i++)
+            {
+                int thisResult = i == 0 ? (int)result : pinvokeResult[i - 1];
+                if (thisResult == (int)expectedResult)
+                    continue;
+
+                allCorrect = false;
+                string callType = i == 0 ? "Tailcall" : callee.DelegateTypes.ElementAt(i - 1).Key.ToString();
+                Console.WriteLine("Mismatch in {0}: {1} ({2} params) -> {3} ({4} params) (expected {5}, got {6})",
+                    callType,
+                    callerName, pms.Count,
+                    callee.Name, callee.Parameters.Count,
+                    expectedResult, thisResult);
+            }
+
+            if (!allCorrect)
+                DumpCallerToCalleeInfo();
+
+            return allCorrect;
         }
 
         // This function works around a reflection bug on ARM64:
         // https://github.com/dotnet/coreclr/issues/25993
-        private static object InvokeMethodDynamicallyButWithoutReflection(MethodInfo mi, object[] args)
+        private static object InvokeMethodDynamicallyButWithoutReflection(MethodInfo mi, object[] args, int[] recordResult)
         {
             DynamicMethod dynCaller = new DynamicMethod(
-                $"DynCaller", typeof(object), new Type[0], typeof(Program).Module);
+                $"DynCaller", typeof(object), new Type[] { typeof(int[]) }, typeof(Program).Module);
 
             ILGenerator g = dynCaller.GetILGenerator();
             foreach (var arg in args)
                 new ConstantValue(new TypeEx(arg.GetType()), arg).Emit(g);
 
+            if (recordResult != null)
+                g.Emit(OpCodes.Ldarg_0);
+
             g.Emit(OpCodes.Call, mi);
             g.Emit(OpCodes.Box, mi.ReturnType);
             g.Emit(OpCodes.Ret);
-            Func<object> f = (Func<object>)dynCaller.CreateDelegate(typeof(Func<object>));
-            return f();
+            Func<int[], object> f = (Func<int[], object>)dynCaller.CreateDelegate(typeof(Func<int[], object>));
+            return f(recordResult);
         }
 
         private static void CollectCandidateArgs(Type targetTy, List<TypeEx> pms, List<Value> candidates)
@@ -237,45 +314,6 @@ namespace TailcallStress
                     candidates.Add(new FieldValue(arg, j));
                 }
             }
-        }
-
-        private static Vector<T> GenConstantVector<T>(Random rand) where T : struct
-        {
-            T[] elements = new T[Vector<T>.Count];
-            for (int i = 0; i < elements.Length; i++)
-                elements[i] = (T)GenConstant(typeof(T), null, rand);
-
-            return new Vector<T>(elements);
-        }
-
-        private static object GenConstant(Type type, FieldInfo[] fields, Random rand)
-        {
-            if (type == typeof(byte))
-                return (byte)rand.Next(byte.MinValue, byte.MaxValue + 1);
-
-            if (type == typeof(short))
-                return (short)rand.Next(short.MinValue, short.MaxValue + 1);
-
-            if (type == typeof(int))
-                return (int)rand.Next();
-
-            if (type == typeof(long))
-                return ((long)rand.Next() << 32) | (uint)rand.Next();
-
-            if (type == typeof(float))
-                return (float)rand.Next(short.MaxValue);
-
-            if (type == typeof(double))
-                return (double)rand.Next();
-
-            if (type == typeof(Vector<int>))
-                return GenConstantVector<int>(rand);
-
-            if (type == typeof(Vector<long>))
-                return GenConstantVector<long>(rand);
-
-            Debug.Assert(fields != null);
-            return Activator.CreateInstance(type, fields.Select(fi => GenConstant(fi.FieldType, null, rand)).ToArray());
         }
 
         private static readonly MethodInfo s_writeString = typeof(Console).GetMethod("Write", new[] { typeof(string) });
@@ -303,9 +341,9 @@ namespace TailcallStress
         }
 
         // Dumps the value on the top of the stack, consuming the value.
-        private static void EmitDumpValue(ILGenerator g, TypeEx ty)
+        private static void EmitDumpValue(ILGenerator g, Type ty)
         {
-            MethodInfo instantiated = s_dumpValue.MakeGenericMethod(ty.Type);
+            MethodInfo instantiated = s_dumpValue.MakeGenericMethod(ty);
             g.Emit(OpCodes.Call, instantiated);
         }
 
@@ -320,7 +358,7 @@ namespace TailcallStress
                 g.Emit(OpCodes.Call, s_writeString);
 
                 emitPlaceValue(index);
-                EmitDumpValue(g, ty);
+                EmitDumpValue(g, ty.Type);
                 index++;
             }
         }
@@ -364,14 +402,16 @@ namespace TailcallStress
             throw new NotSupportedException($"Platform {Environment.OSVersion.Platform} is not supported");
         }
 
-        private class TailCallee
+        private class Callee
         {
             private static readonly MethodInfo s_hashCodeAddMethod =
                 typeof(HashCode).GetMethods().Single(mi => mi.Name == "Add" && mi.GetParameters().Length == 1);
             private static readonly MethodInfo s_hashCodeToHashCodeMethod =
                 typeof(HashCode).GetMethod("ToHashCode");
 
-            public TailCallee(string name, List<TypeEx> parameters)
+            private readonly Dictionary<CallingConvention, Type> _delegateTypes = new Dictionary<CallingConvention, Type>();
+
+            public Callee(string name, List<TypeEx> parameters)
             {
                 Name = name;
                 Parameters = parameters;
@@ -382,6 +422,7 @@ namespace TailcallStress
             public List<TypeEx> Parameters { get; }
             public int ArgStackSizeApprox { get; }
             public DynamicMethod Method { get; private set; }
+            public IReadOnlyDictionary<CallingConvention, Type> DelegateTypes => _delegateTypes;
 
             public void Emit()
             {
@@ -394,7 +435,7 @@ namespace TailcallStress
                 ILGenerator g = Method.GetILGenerator();
                 LocalBuilder hashCode = g.DeclareLocal(typeof(HashCode));
 
-                if (s_verbose)
+                if (Config.Verbose)
                     EmitDumpArgList(g, Parameters, i => g.Emit(OpCodes.Ldarg, checked((short)i)), "Callee incoming parameters");
 
                 g.Emit(OpCodes.Ldloca, hashCode);
@@ -411,347 +452,48 @@ namespace TailcallStress
                 g.Emit(OpCodes.Ldloca, hashCode);
                 g.Emit(OpCodes.Call, s_hashCodeToHashCodeMethod);
                 g.Emit(OpCodes.Ret);
-            }
-        }
 
-        private abstract class Value
-        {
-            public Value(TypeEx type)
-            {
-                Type = type;
+                EmitDelegates();
             }
 
-            public TypeEx Type { get; }
+            private static ModuleBuilder s_delegateTypesModule;
+            private static ConstructorInfo s_unmanagedFunctionPointerCtor =
+                typeof(UnmanagedFunctionPointerAttribute).GetConstructor(new[] { typeof(CallingConvention) });
 
-            public abstract object Get(object[] args);
-            public abstract void Emit(ILGenerator il);
-        }
-
-        private class ArgValue : Value
-        {
-            public ArgValue(TypeEx type, int index) : base(type)
+            private void EmitDelegates()
             {
-                Index = index;
-            }
-
-            public int Index { get; }
-
-            public override object Get(object[] args) => args[Index];
-            public override void Emit(ILGenerator il)
-            {
-                il.Emit(OpCodes.Ldarg, checked((short)Index));
-            }
-        }
-
-        private class FieldValue : Value
-        {
-            public FieldValue(Value val, int fieldIndex) : base(new TypeEx(val.Type.Fields[fieldIndex].FieldType))
-            {
-                Value = val;
-                FieldIndex = fieldIndex;
-            }
-
-            public Value Value { get; }
-            public int FieldIndex { get; }
-
-            public override object Get(object[] args)
-            {
-                object value = Value.Get(args);
-                value = Value.Type.Fields[FieldIndex].GetValue(value);
-                return value;
-            }
-
-            public override void Emit(ILGenerator il)
-            {
-                Value.Emit(il);
-                il.Emit(OpCodes.Ldfld, Value.Type.Fields[FieldIndex]);
-            }
-        }
-
-        private class ConstantValue : Value
-        {
-            public ConstantValue(TypeEx type, object value) : base(type)
-            {
-                Value = value;
-            }
-
-            public object Value { get; }
-
-            public override object Get(object[] args) => Value;
-            public override void Emit(ILGenerator il)
-            {
-                if (Type.Fields == null)
+                if (s_delegateTypesModule == null)
                 {
-                    EmitLoadPrimitive(il, Value);
-                    return;
+                    AssemblyBuilder delegates = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName("ABIStress_Delegates"), AssemblyBuilderAccess.Run);
+                    s_delegateTypesModule = delegates.DefineDynamicModule("ABIStress_Delegates");
                 }
 
-                foreach (FieldInfo field in Type.Fields)
-                    EmitLoadPrimitive(il, field.GetValue(Value));
-
-                il.Emit(OpCodes.Newobj, Type.Ctor);
-            }
-
-            private static void EmitLoadVector<T>(ILGenerator il, Vector<T> val) where T : struct
-            {
-                il.Emit(OpCodes.Ldc_I4, Vector<T>.Count);
-                il.Emit(OpCodes.Newarr, typeof(T));
-                for (int i = 0; i < Vector<T>.Count; i++)
+                foreach (CallingConvention cc in s_abi.CallingConventions)
                 {
-                    il.Emit(OpCodes.Dup);
-                    il.Emit(OpCodes.Ldc_I4, i);
-                    EmitLoadPrimitive(il, val[i]);
-                    il.Emit(OpCodes.Stelem, typeof(T));
-                }
+                    // This code is based on DelegateHelpers.cs in System.Linq.Expressions.Compiler
+                    TypeBuilder tb =
+                        s_delegateTypesModule.DefineType(
+                            $"{Name}_Delegate_{cc}",
+                            TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.AutoClass,
+                            typeof(MulticastDelegate));
 
-                ConstructorInfo ctor = typeof(Vector<T>).GetConstructor(new[] { typeof(T[]) });
-                il.Emit(OpCodes.Newobj, ctor);
-            }
+                    tb.DefineConstructor(
+                        MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.RTSpecialName,
+                        CallingConventions.Standard,
+                        new[] { typeof(object), typeof(IntPtr) })
+                      .SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
 
-            private static void EmitLoadPrimitive(ILGenerator il, object val)
-            {
-                Type ty = val.GetType();
-                if (ty == typeof(byte))
-                    il.Emit(OpCodes.Ldc_I4, (int)(byte)val);
-                else if (ty == typeof(short))
-                    il.Emit(OpCodes.Ldc_I4, (int)(short)val);
-                else if (ty == typeof(int))
-                    il.Emit(OpCodes.Ldc_I4, (int)val);
-                else if (ty == typeof(long))
-                    il.Emit(OpCodes.Ldc_I8, (long)val);
-                else if (ty == typeof(float))
-                    il.Emit(OpCodes.Ldc_R4, (float)val);
-                else if (ty == typeof(double))
-                    il.Emit(OpCodes.Ldc_R8, (double)val);
-                else if (ty == typeof(Vector<int>))
-                    EmitLoadVector(il, (Vector<int>)val);
-                else if (ty == typeof(Vector<long>))
-                    EmitLoadVector(il, (Vector<long>)val);
-                else
-                    throw new NotSupportedException("Other primitives are currently not supported");
-            }
-        }
+                    tb.DefineMethod(
+                        "Invoke",
+                        MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.NewSlot | MethodAttributes.Virtual,
+                        typeof(int),
+                        Parameters.Select(t => t.Type).ToArray())
+                      .SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
 
-        private class TypeEx
-        {
-            public Type Type { get; }
-            public int Size { get; }
-            public FieldInfo[] Fields { get; }
-            public ConstructorInfo Ctor { get; }
-
-            public TypeEx(Type t)
-            {
-                Type = t;
-                Size = Marshal.SizeOf(Activator.CreateInstance(t));
-                if (!t.IsOurStructType())
-                    return;
-
-                Fields = Enumerable.Range(0, 10000).Select(i => t.GetField($"F{i}")).TakeWhile(fi => fi != null).ToArray();
-                Ctor = t.GetConstructor(Fields.Select(f => f.FieldType).ToArray());
-            }
-        }
-
-        private interface IAbi
-        {
-            Type[] CandidateArgTypes { get; }
-            int ApproximateArgStackAreaSize(List<TypeEx> parameters);
-        }
-
-        private class Win86Abi : IAbi
-        {
-            public Type[] CandidateArgTypes { get; } =
-                new[]
-                {
-                    typeof(byte), typeof(short), typeof(int), typeof(long),
-                    typeof(float), typeof(double),
-                    typeof(Vector<int>), typeof(Vector<long>),
-                    typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
-                    typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
-                    typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
-                    typeof(S10U), typeof(S11U), typeof(S12U), typeof(S13U),
-                    typeof(S14U), typeof(S15U), typeof(S16U), typeof(S17U),
-                    typeof(S31U), typeof(S32U),
-                };
-
-            public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
-            {
-                int size = 0;
-                foreach (TypeEx pm in parameters)
-                    size += (pm.Size + 3) & ~3;
-
-                return size;
-            }
-        }
-
-        private class Win64Abi : IAbi
-        {
-            // On Win x64, only 1, 2, 4, and 8-byte sized structs can be passed on the stack.
-            // Other structs will be passed by reference and will require helper.
-            public Type[] CandidateArgTypes { get; } =
-                new[]
-                {
-                    typeof(byte), typeof(short), typeof(int), typeof(long),
-                    typeof(float), typeof(double),
-                    typeof(S1P), typeof(S2P), typeof(S2U), typeof(S4P),
-                    typeof(S4U), typeof(S8P), typeof(S8U),
-                };
-
-            public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
-            {
-                int size = 0;
-                foreach (TypeEx pm in parameters)
-                    size += (pm.Size + 7) & ~7;
-
-                // On win64 there's always 32 bytes of stack space allocated.
-                size = Math.Max(size, 32);
-                return size;
-            }
-        }
-
-        private class SysVAbi : IAbi
-        {
-            // For SysV everything can be passed everything by value.
-            public Type[] CandidateArgTypes { get; } =
-                new[]
-                {
-                    typeof(byte), typeof(short), typeof(int), typeof(long),
-                    typeof(float), typeof(double),
-                    typeof(Vector<int>), typeof(Vector<long>),
-                    typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
-                    typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
-                    typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
-                    typeof(S10U), typeof(S11U), typeof(S12U), typeof(S13U),
-                    typeof(S14U), typeof(S15U), typeof(S16U), typeof(S17U),
-                    typeof(S31U), typeof(S32U),
-                };
-
-            public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
-            {
-                int size = 0;
-                foreach (TypeEx pm in parameters)
-                    size += (pm.Size + 7) & ~7;
-
-                return size;
-            }
-        }
-
-        private class Arm64Abi : IAbi
-        {
-            // For Arm64 everything can be passed everything by value.
-            public Type[] CandidateArgTypes { get; } =
-                new[]
-                {
-                    typeof(byte), typeof(short), typeof(int), typeof(long),
-                    typeof(float), typeof(double),
-                    typeof(Vector<int>), typeof(Vector<long>),
-                    typeof(S1P), typeof(S2P), typeof(S2U), typeof(S3U),
-                    typeof(S4P), typeof(S4U), typeof(S5U), typeof(S6U),
-                    typeof(S7U), typeof(S8P), typeof(S8U), typeof(S9U),
-                    typeof(S10U), typeof(S11U), typeof(S12U), typeof(S13U),
-                    typeof(S14U), typeof(S15U), typeof(S16U), typeof(S17U),
-                    typeof(S31U), typeof(S32U),
-                    typeof(Hfa1), typeof(Hfa2),
-                };
-
-            public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
-            {
-                int size = 0;
-                foreach (TypeEx pm in parameters)
-                    size += (pm.Size + 7) & ~7;
-
-                return size;
-            }
-        }
-
-
-        private class TailCallEventListener : EventListener
-        {
-            public int NumCallersSeen { get; set; }
-            public int NumSuccessfulTailCalls { get; set; }
-            public Dictionary<string, int> FailureReasons { get; } = new Dictionary<string, int>();
-
-            protected override void OnEventSourceCreated(EventSource eventSource)
-            {
-                if (eventSource.Name != "Microsoft-Windows-DotNETRuntime")
-                    return;
-
-                EventKeywords jitTracing = (EventKeywords)0x61098; // JITSymbols | JITTracing
-                EnableEvents(eventSource, EventLevel.Verbose, jitTracing);
-            }
-
-            protected override void OnEventWritten(EventWrittenEventArgs data)
-            {
-                string GetData(string name) => data.Payload[data.PayloadNames.IndexOf(name)].ToString();
-
-                switch (data.EventName)
-                {
-                    case "MethodJitTailCallFailed":
-                        if (GetData("MethodBeingCompiledName").StartsWith(CallerPrefix))
-                        {
-                            NumCallersSeen++;
-                            string failReason = GetData("FailReason");
-                            lock (FailureReasons)
-                            {
-                                FailureReasons[failReason] = FailureReasons.GetValueOrDefault(failReason) + 1;
-                            }
-                        }
-                        break;
-                    case "MethodJitTailCallSucceeded":
-                        if (GetData("MethodBeingCompiledName").StartsWith(CallerPrefix))
-                        {
-                            NumCallersSeen++;
-                            NumSuccessfulTailCalls++;
-                        }
-                        break;
+                    tb.SetCustomAttribute(new CustomAttributeBuilder(s_unmanagedFunctionPointerCtor, new object[] { cc }));
+                    _delegateTypes.Add(cc, tb.CreateType());
                 }
             }
-        }
-    }
-
-    // U suffix = unpromotable, P suffix = promotable by the JIT.
-    // Note that fields must be named Fi with i sequential.
-    struct S1P { public byte F0; public S1P(byte f0) => F0 = f0; }
-    struct S2P { public short F0; public S2P(short f0) => F0 = f0; }
-    struct S2U { public byte F0, F1; public S2U(byte f0, byte f1) => (F0, F1) = (f0, f1); }
-    struct S3U { public byte F0, F1, F2; public S3U(byte f0, byte f1, byte f2) => (F0, F1, F2) = (f0, f1, f2); }
-    struct S4P { public int F0; public S4P(int f0) => F0 = f0; }
-    struct S4U { public byte F0, F1, F2, F3; public S4U(byte f0, byte f1, byte f2, byte f3) => (F0, F1, F2, F3) = (f0, f1, f2, f3); }
-    struct S5U { public byte F0, F1, F2, F3, F4; public S5U(byte f0, byte f1, byte f2, byte f3, byte f4) => (F0, F1, F2, F3, F4) = (f0, f1, f2, f3, f4); }
-    struct S6U { public byte F0, F1, F2, F3, F4, F5; public S6U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5) => (F0, F1, F2, F3, F4, F5) = (f0, f1, f2, f3, f4, f5); }
-    struct S7U { public byte F0, F1, F2, F3, F4, F5, F6; public S7U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6) => (F0, F1, F2, F3, F4, F5, F6) = (f0, f1, f2, f3, f4, f5, f6); }
-    struct S8P { public long F0; public S8P(long f0) => F0 = f0; }
-    struct S8U { public byte F0, F1, F2, F3, F4, F5, F6, F7; public S8U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7) => (F0, F1, F2, F3, F4, F5, F6, F7) = (f0, f1, f2, f3, f4, f5, f6, f7); }
-    struct S9U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8; public S9U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8) => (F0, F1, F2, F3, F4, F5, F6, F7, F8) = (f0, f1, f2, f3, f4, f5, f6, f7, f8); }
-    struct S10U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9; public S10U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9); }
-    struct S11U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10; public S11U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10); }
-    struct S12U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11; public S12U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11); }
-    struct S13U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12; public S13U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12); }
-    struct S14U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13; public S14U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13); }
-    struct S15U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14; public S15U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14); }
-    struct S16U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15; public S16U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15); }
-    struct S17U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16; public S17U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16); }
-    struct S31U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30; public S31U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30); }
-    struct S32U { public byte F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31; public S32U(byte f0, byte f1, byte f2, byte f3, byte f4, byte f5, byte f6, byte f7, byte f8, byte f9, byte f10, byte f11, byte f12, byte f13, byte f14, byte f15, byte f16, byte f17, byte f18, byte f19, byte f20, byte f21, byte f22, byte f23, byte f24, byte f25, byte f26, byte f27, byte f28, byte f29, byte f30, byte f31) => (F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31) = (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29, f30, f31); }
-    struct Hfa1 { public float F0, F1; public Hfa1(float f0, float f1) => (F0, F1) = (f0, f1); }
-    struct Hfa2 { public double F0, F1, F2, F3; public Hfa2(double f0, double f1, double f2, double f3) => (F0, F1, F2, F3) = (f0, f1, f2, f3); }
-
-    internal static class TypeExtensions
-    {
-        public static bool IsOurStructType(this Type t)
-        {
-            return
-                t == typeof(S1P) || t == typeof(S2P) ||
-                t == typeof(S2U) || t == typeof(S3U) ||
-                t == typeof(S4P) || t == typeof(S4U) ||
-                t == typeof(S5U) || t == typeof(S6U) ||
-                t == typeof(S7U) || t == typeof(S8P) ||
-                t == typeof(S8U) || t == typeof(S9U) ||
-                t == typeof(S10U) || t == typeof(S11U) ||
-                t == typeof(S12U) || t == typeof(S13U) ||
-                t == typeof(S14U) || t == typeof(S15U) ||
-                t == typeof(S16U) || t == typeof(S17U) ||
-                t == typeof(S31U) || t == typeof(S32U) ||
-                t == typeof(Hfa1) || t == typeof(Hfa2);
         }
     }
 }
