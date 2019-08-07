@@ -4,9 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
-using System.Reflection.Metadata;
 using System.Runtime.InteropServices;
-using System.Runtime.Loader;
 
 namespace ABIStress
 {
@@ -102,7 +100,7 @@ namespace ABIStress
 
         private static List<TypeEx> RandomParameters(Random rand)
         {
-            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 7));
+            List<TypeEx> pms = new List<TypeEx>(rand.Next(1, 25));
             for (int j = 0; j < pms.Capacity; j++)
                 pms.Add(s_candidateArgTypes[rand.Next(s_candidateArgTypes.Length)]);
 
@@ -462,6 +460,10 @@ namespace ABIStress
 
             private void EmitDelegates()
             {
+                // Marshalling cannot handle generic types so we currently skip testing these.
+                if (Parameters.Any(pm => pm.Type.IsGenericType))
+                    return;
+
                 if (s_delegateTypesModule == null)
                 {
                     AssemblyBuilder delegates = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName("ABIStress_Delegates"), AssemblyBuilderAccess.Run);
