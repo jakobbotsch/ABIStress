@@ -58,6 +58,11 @@ namespace ABIStress
                 return 1;
             }
 
+            if (Config.StressModes.HasFlag(StressModes.TailCalls))
+                Console.WriteLine("Stressing tailcalls");
+            if (Config.StressModes.HasFlag(StressModes.PInvokes))
+                Console.WriteLine("Stressing pinvokes");
+
             using var tcel = new TailCallEventListener();
 
             int mismatches = 0;
