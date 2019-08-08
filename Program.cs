@@ -256,6 +256,8 @@ namespace ABIStress
             (object callerResult, object calleeResult) =
                 InvokeCallerCallee(caller, pms, callee.Method, args, rand);
 
+            GC.KeepAlive(delegates);
+
             int[] results = (int[])callerResult;
 
             bool allCorrect = true;
