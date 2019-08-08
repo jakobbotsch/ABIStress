@@ -9,14 +9,14 @@ namespace ABIStress
 {
     internal interface IAbi
     {
-        Type[] CandidateArgTypes { get; }
-        CallingConvention[] CallingConventions { get; }
+        Type[] TailCalleeCandidateArgTypes { get; }
+        CallingConvention[] PInvokeConventions { get; }
         int ApproximateArgStackAreaSize(List<TypeEx> parameters);
     }
 
     internal class Win86Abi : IAbi
     {
-        public Type[] CandidateArgTypes { get; } =
+        public Type[] TailCalleeCandidateArgTypes { get; } =
             new[]
             {
                 typeof(byte), typeof(short), typeof(int), typeof(long),
@@ -30,7 +30,7 @@ namespace ABIStress
                 typeof(S31U), typeof(S32U),
             };
 
-        public CallingConvention[] CallingConventions { get; } = { CallingConvention.Cdecl, CallingConvention.StdCall, CallingConvention.ThisCall, };
+        public CallingConvention[] PInvokeConventions { get; } = { CallingConvention.Cdecl, CallingConvention.StdCall, CallingConvention.ThisCall, };
 
         public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
         {
@@ -46,7 +46,7 @@ namespace ABIStress
     {
         // On Win x64, only 1, 2, 4, and 8-byte sized structs can be passed on the stack.
         // Other structs will be passed by reference and will require helper.
-        public Type[] CandidateArgTypes { get; } =
+        public Type[] TailCalleeCandidateArgTypes { get; } =
             new[]
             {
                 typeof(byte), typeof(short), typeof(int), typeof(long),
@@ -55,13 +55,17 @@ namespace ABIStress
                 typeof(S4U), typeof(S8P), typeof(S8U),
             };
 
-        public CallingConvention[] CallingConventions { get; } = { CallingConvention.Cdecl };
+        public CallingConvention[] PInvokeConventions { get; } = { CallingConvention.Cdecl };
 
         public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
         {
             int size = 0;
             foreach (TypeEx pm in parameters)
-                size += (pm.Size + 7) & ~7;
+            {
+                // 1, 2, 4 and 8 byte structs are passed directly by value, everything else
+                // by ref.
+                size += 8;
+            }
 
             // On win64 there's always 32 bytes of stack space allocated.
             size = Math.Max(size, 32);
@@ -72,7 +76,7 @@ namespace ABIStress
     internal class SysVAbi : IAbi
     {
         // For SysV everything can be passed everything by value.
-        public Type[] CandidateArgTypes { get; } =
+        public Type[] TailCalleeCandidateArgTypes { get; } =
             new[]
             {
                 typeof(byte), typeof(short), typeof(int), typeof(long),
@@ -88,7 +92,7 @@ namespace ABIStress
                 typeof(S31U), typeof(S32U),
             };
 
-        public CallingConvention[] CallingConventions { get; } = { CallingConvention.Cdecl };
+        public CallingConvention[] PInvokeConventions { get; } = { CallingConvention.Cdecl };
 
         public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
         {
@@ -103,7 +107,7 @@ namespace ABIStress
     internal class Arm64Abi : IAbi
     {
         // For Arm64 everything can be passed everything by value.
-        public Type[] CandidateArgTypes { get; } =
+        public Type[] TailCalleeCandidateArgTypes { get; } =
             new[]
             {
                 typeof(byte), typeof(short), typeof(int), typeof(long),
@@ -118,7 +122,7 @@ namespace ABIStress
                 typeof(Hfa1), typeof(Hfa2),
             };
 
-        public CallingConvention[] CallingConventions { get; } = { CallingConvention.Cdecl };
+        public CallingConvention[] PInvokeConventions { get; } = { CallingConvention.Cdecl };
 
         public int ApproximateArgStackAreaSize(List<TypeEx> parameters)
         {

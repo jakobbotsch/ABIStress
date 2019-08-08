@@ -26,7 +26,7 @@ namespace ABIStress
             switch (data.EventName)
             {
                 case "MethodJitTailCallFailed":
-                    if (GetData("MethodBeingCompiledName").StartsWith(Config.CallerPrefix))
+                    if (GetData("MethodBeingCompiledName").StartsWith(Config.TailCallerPrefix))
                     {
                         NumCallersSeen++;
                         string failReason = GetData("FailReason");
@@ -37,7 +37,7 @@ namespace ABIStress
                     }
                     break;
                 case "MethodJitTailCallSucceeded":
-                    if (GetData("MethodBeingCompiledName").StartsWith(Config.CallerPrefix))
+                    if (GetData("MethodBeingCompiledName").StartsWith(Config.TailCallerPrefix))
                     {
                         NumCallersSeen++;
                         NumSuccessfulTailCalls++;
