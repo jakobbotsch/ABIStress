@@ -125,12 +125,11 @@ namespace ABIStress
         // https://github.com/dotnet/coreclr/issues/26054
         private static readonly HashSet<int> s_pinvokeInfiniteLoops = new HashSet<int>
         {
-            56, 113, 173, 611, 734
+            56, 113, 173, 611, 734, 863, 897, 960
         };
 
         private static bool DoCall(int index)
         {
-            Console.WriteLine(index);
             bool result = true;
             if (Config.StressModes.HasFlag(StressModes.TailCalls))
                 result &= DoTailCall(index);
