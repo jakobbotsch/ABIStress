@@ -22,7 +22,7 @@ namespace ABIStress
         {
             void Usage()
             {
-                Console.WriteLine("Usage: [--verbose] [--caller-index <number>] [--num-calls <number>] [--tailcalls] [--pinvokes]");
+                Console.WriteLine("Usage: [--verbose] [--caller-index <number>] [--num-calls <number>] [--tailcalls] [--pinvokes] [--no-ctrlc-summary]");
                 Console.WriteLine("Either --caller-index or --num-calls must be specified.");
                 Console.WriteLine("Example: --num-calls 100");
                 Console.WriteLine("  Stress first 100 tailcalls and pinvokes");
@@ -62,6 +62,8 @@ namespace ABIStress
                 return 1;
             }
 
+            bool noCtrlCSummary = args.Contains("--no-ctrlc-summary");
+
             if (Config.StressModes.HasFlag(StressModes.TailCalls))
                 Console.WriteLine("Stressing tailcalls");
             if (Config.StressModes.HasFlag(StressModes.PInvokes))
@@ -78,11 +80,14 @@ namespace ABIStress
             else
             {
                 bool abortLoop = false;
-                Console.CancelKeyPress += (sender, args) =>
+                if (!noCtrlCSummary)
                 {
-                    args.Cancel = true;
-                    abortLoop = true;
-                };
+                    Console.CancelKeyPress += (sender, args) =>
+                    {
+                        args.Cancel = true;
+                        abortLoop = true;
+                    };
+                }
 
                 for (int i = 0; i < numCalls && !abortLoop; i++)
                 {
@@ -117,12 +122,19 @@ namespace ABIStress
             return 100 + mismatches;
         }
 
+        // https://github.com/dotnet/coreclr/issues/26054
+        private static readonly HashSet<int> s_pinvokeInfiniteLoops = new HashSet<int>
+        {
+            56, 113, 173, 611, 734
+        };
+
         private static bool DoCall(int index)
         {
+            Console.WriteLine(index);
             bool result = true;
             if (Config.StressModes.HasFlag(StressModes.TailCalls))
                 result &= DoTailCall(index);
-            if (Config.StressModes.HasFlag(StressModes.PInvokes))
+            if (Config.StressModes.HasFlag(StressModes.PInvokes) && !s_pinvokeInfiniteLoops.Contains(index))
                 result &= DoPInvokes(index);
 
             return result;
